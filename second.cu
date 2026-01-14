@@ -1,54 +1,32 @@
 #include <cuda.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <chrono>
+#include <cmath>
 
 #define ROWS 1024
 #define COLS 1024
-#define ITER 100
-#define BLOCK 16
-#define EPS 1e-4
-#define T 4
+#define ITERS 100
+
+#define BX 32
+#define BY 32
+#define TIME_TILE 4
+
 #define IDX(i, j) ((i) * COLS + (j))
 
-// Trapezoid method
-#define H 4 // trapezoid height
-#define TILE 8
-#define SHARED (TILE + 2 * H)
-
-// verification for Case 1 and Case 2
-bool verify(float *a, float *b)
-{
-    for (int i = 0; i < ROWS * COLS; i++)
-        if (fabs(a[i] - b[i]) > EPS)
-            return false;
-    return true;
-}
-
-// verification for Case 3 and Case 4
-bool verify_interior(float *a, float *b)
-{
-    for (int i = H; i < ROWS - H; i++)
-        for (int j = H; j < COLS - H; j++)
-            if (fabs(a[IDX(i, j)] - b[IDX(i, j)]) > EPS)
-                return false;
-    return true;
-}
-
-// CPU reference
+/************************ CPU REFERENCE *************************/
 void cpu_stencil(float *A, float *B)
 {
-    for (int k = 0; k < ITER; k++)
+    for (int t = 0; t < ITERS; t++)
     {
         for (int i = 0; i < ROWS; i++)
         {
             for (int j = 0; j < COLS; j++)
             {
-                int top = (i == 0) ? 0 : i - 1;
-                int bottom = (i == ROWS - 1) ? ROWS - 1 : i + 1;
-                int left = (j == 0) ? 0 : j - 1;
-                int right = (j == COLS - 1) ? COLS - 1 : j + 1;
+                int top = max(i - 1, 0);
+                int bottom = min(i + 1, ROWS - 1);
+                int left = max(j - 1, 0);
+                int right = min(j + 1, COLS - 1);
 
                 A[IDX(i, j)] =
                     B[IDX(i, j)] +
@@ -62,12 +40,78 @@ void cpu_stencil(float *A, float *B)
     }
 }
 
-// Case:1  Baseline – Global Memory Only
-
+/**************** CASE 1: GLOBAL, NO TRAPEZOID ******************/
 __global__ void stencil_global(float *A, float *B)
 {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = blockIdx.y * BY + threadIdx.y;
+    int j = blockIdx.x * BX + threadIdx.x;
+    if (i >= ROWS || j >= COLS)
+        return;
+
+    int top = max(i - 1, 0);
+    int bottom = min(i + 1, ROWS - 1);
+    int left = max(j - 1, 0);
+    int right = min(j + 1, COLS - 1);
+
+    A[IDX(i, j)] =
+        B[IDX(i, j)] +
+        B[IDX(top, j)] +
+        B[IDX(bottom, j)] +
+        B[IDX(i, left)] +
+        B[IDX(i, right)];
+}
+
+/**************** CASE 2: SHARED, NO TRAPEZOID ******************/
+__global__ void stencil_shared(float *A, float *B)
+{
+    __shared__ float in_s[BY + 2][BX + 2];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int i = blockIdx.y * BY + ty;
+    int j = blockIdx.x * BX + tx;
+
+    int si = ty + 1;
+    int sj = tx + 1;
+
+    // Load center
+    if (i < ROWS && j < COLS)
+        in_s[si][sj] = B[IDX(i, j)];
+    else
+        in_s[si][sj] = 0.0f;
+
+    // Load halos (exactly like textbook)
+    if (ty == 0)
+        in_s[0][sj] = (i > 0) ? B[IDX(i - 1, j)] : in_s[si][sj];
+
+    if (ty == BY - 1)
+        in_s[BY + 1][sj] = (i + 1 < ROWS) ? B[IDX(i + 1, j)] : in_s[si][sj];
+
+    if (tx == 0)
+        in_s[si][0] = (j > 0) ? B[IDX(i, j - 1)] : in_s[si][sj];
+
+    if (tx == BX - 1)
+        in_s[si][BX + 1] = (j + 1 < COLS) ? B[IDX(i, j + 1)] : in_s[si][sj];
+
+    __syncthreads();
+
+    if (i < ROWS && j < COLS)
+    {
+        A[IDX(i, j)] =
+            in_s[si][sj] +
+            in_s[si - 1][sj] +
+            in_s[si + 1][sj] +
+            in_s[si][sj - 1] +
+            in_s[si][sj + 1];
+    }
+}
+
+/************* CASE 3: TRAPEZOID, GLOBAL MEM ********************/
+__global__ void stencil_trap_global(float *A, float *B)
+{
     int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i >= ROWS || j >= COLS)
         return;
@@ -85,31 +129,32 @@ __global__ void stencil_global(float *A, float *B)
         B[IDX(i, right)];
 }
 
-// Case 2: Baseline - Shared Memory
-
-__global__ void stencil_shared(float *A, float *B)
+/************* CASE 4: TRAPEZOID + SHARED ***********************/
+__global__ void stencil_trap_shared(float *A, float *B)
 {
-    __shared__ float tile[BLOCK + 2][BLOCK + 2];
+    __shared__ float tile[BY + 2][BX + 2];
 
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int i = blockIdx.y * BLOCK + ty;
-    int j = blockIdx.x * BLOCK + tx;
+
+    int i = blockIdx.y * BY + ty;
+    int j = blockIdx.x * BX + tx;
 
     int si = ty + 1;
     int sj = tx + 1;
 
-    if (i < ROWS && j < COLS)
-        tile[si][sj] = B[IDX(i, j)];
+    // Center
+    tile[si][sj] = (i < ROWS && j < COLS) ? B[IDX(i, j)] : 0.0f;
 
-    if (ty == 0 && i > 0)
-        tile[0][sj] = B[IDX(i - 1, j)];
-    if (ty == BLOCK - 1 && i < ROWS - 1)
-        tile[si + 1][sj] = B[IDX(i + 1, j)];
-    if (tx == 0 && j > 0)
-        tile[si][0] = B[IDX(i, j - 1)];
-    if (tx == BLOCK - 1 && j < COLS - 1)
-        tile[si][sj + 1] = B[IDX(i, j + 1)];
+    // Halos
+    if (ty == 0)
+        tile[0][sj] = (i > 0) ? B[IDX(i - 1, j)] : B[IDX(i, j)];
+    if (ty == BY - 1)
+        tile[BY + 1][sj] = (i + 1 < ROWS) ? B[IDX(i + 1, j)] : B[IDX(i, j)];
+    if (tx == 0)
+        tile[si][0] = (j > 0) ? B[IDX(i, j - 1)] : B[IDX(i, j)];
+    if (tx == BX - 1)
+        tile[si][BX + 1] = (j + 1 < COLS) ? B[IDX(i, j + 1)] : B[IDX(i, j)];
 
     __syncthreads();
 
@@ -124,313 +169,129 @@ __global__ void stencil_shared(float *A, float *B)
     }
 }
 
-// case 3: TRAPEZOID - GLOBAL MEMORY
 
-// __global__ void stencil_true_trap_global(float *A, float *B)
-// {
-//     int i = blockIdx.y * TILE + threadIdx.y;
-//     int j = blockIdx.x * TILE + threadIdx.x;
-
-//     if (threadIdx.x >= TILE || threadIdx.y >= TILE)
-//         return;
-//     if (i < H || i >= ROWS - H || j < H || j >= COLS - H)
-//         return;
-
-//     float curr = B[IDX(i, j)];
-
-//     for (int t = 0; t < H; t++)
-//     {
-//         int top = i - 1;
-//         int bottom = i + 1;
-//         int left = j - 1;
-//         int right = j + 1;
-
-//         curr =
-//             curr +
-//             B[IDX(top, j)] +
-//             B[IDX(bottom, j)] +
-//             B[IDX(i, left)] +
-//             B[IDX(i, right)];
-
-//         __syncthreads();
-//     }
-
-//     A[IDX(i, j)] = curr;
-// }
-__global__ void stencil_true_trap_global(float *A, float *B,
-                                         int rows, int cols,
-                                         int margin)
+bool check(float *a, float *b)
 {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < margin || i >= rows - margin ||
-        j < margin || j >= cols - margin)
-        return;
-
-    A[IDX(i, j)] =
-        B[IDX(i, j)] +
-        B[IDX(i - 1, j)] +
-        B[IDX(i + 1, j)] +
-        B[IDX(i, j - 1)] +
-        B[IDX(i, j + 1)];
-}
-
-// Case 4:TRAPEZOID - SHARED MEMORY
-// __global__ void stencil_true_trap_shared(float *A, float *B)
-// {
-//     __shared__ float tile[SHARED][SHARED];
-
-//     int tx = threadIdx.x;
-//     int ty = threadIdx.y;
-
-//     int bx = blockIdx.x * TILE;
-//     int by = blockIdx.y * TILE;
-
-//     int gi = by + ty - H;
-//     int gj = bx + tx - H;
-
-//     // Load halo
-//     if (gi >= 0 && gi < ROWS && gj >= 0 && gj < COLS)
-//         tile[ty][tx] = B[IDX(gi, gj)];
-//     else
-//         tile[ty][tx] = 0.0f;
-
-//     __syncthreads();
-
-//     // Trapezoid time steps
-//     for (int t = 0; t < H; t++)
-//     {
-//         if (ty >= H + t && ty < SHARED - H - t &&
-//             tx >= H + t && tx < SHARED - H - t)
-//         {
-//             tile[ty][tx] =
-//                 tile[ty][tx] +
-//                 tile[ty - 1][tx] +
-//                 tile[ty + 1][tx] +
-//                 tile[ty][tx - 1] +
-//                 tile[ty][tx + 1];
-//         }
-//         __syncthreads();
-//     }
-
-//     if (ty >= H && ty < H + TILE &&
-//         tx >= H && tx < H + TILE)
-//     {
-//         int oi = by + ty - H;
-//         int oj = bx + tx - H;
-
-//         if (oi >= H && oi < ROWS - H &&
-//             oj >= H && oj < COLS - H)
-//         {
-//             A[IDX(oi, oj)] = tile[ty][tx];
-//         }
-//     }
-// }
-__global__ void stencil_true_trap_shared(float *A, float *B)
-{
-    __shared__ float tile[SHARED][SHARED + 1];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int base_x = blockIdx.x * TILE;
-    int base_y = blockIdx.y * TILE;
-
-    // Global index for loading halo
-    int gi = base_y + ty - H;
-    int gj = base_x + tx - H;
-
-    // Cooperative load (coalesced)
-    if (gi >= 0 && gi < ROWS && gj >= 0 && gj < COLS)
-        tile[ty][tx] = B[IDX(gi, gj)];
-    else
-        tile[ty][tx] = 0.0f;
-
-    __syncthreads();
-
-    // Trapezoid timesteps
-    for (int t = 0; t < H; t++)
-    {
-        int y = ty;
-        int x = tx;
-
-        if (y >= H + t && y < SHARED - H - t &&
-            x >= H + t && x < SHARED - H - t)
-        {
-            float center = tile[y][x];
-
-            center += tile[y - 1][x];
-            center += tile[y + 1][x];
-            center += tile[y][x - 1];
-            center += tile[y][x + 1];
-
-            tile[y][x] = center;
-        }
-        __syncthreads();
-    }
-
-    // Store valid TILE region
-    if (tx >= H && tx < H + TILE &&
-        ty >= H && ty < H + TILE)
-    {
-        int oi = base_y + ty - H;
-        int oj = base_x + tx - H;
-
-        if (oi >= H && oi < ROWS - H &&
-            oj >= H && oj < COLS - H)
-        {
-            A[IDX(oi, oj)] = tile[ty][tx];
-        }
-    }
+    for (int i = 0; i < ROWS * COLS; i++)
+        if (fabs(a[i] - b[i]) > 1e-3)
+            return false;
+    return true;
 }
 
 int main()
 {
-    size_t size = ROWS * COLS * sizeof(float);
+    size_t N = ROWS * COLS * sizeof(float);
 
-    // Host memory
-    float *hA = (float *)malloc(size);
-    float *hB = (float *)malloc(size);
-    float *hRef = (float *)malloc(size);
-    float *hOut = (float *)malloc(size);
+    float *hA = (float *)malloc(N);
+    float *hB = (float *)malloc(N);
+    float *ref = (float *)malloc(N);
 
-    // Initialize input
     for (int i = 0; i < ROWS * COLS; i++)
-        hB[i] = (float)(i + 1);
+        hB[i] = 1.0f * (i + 1);
 
-    // ---------- CPU Reference ----------
-    memcpy(hRef, hB, size);
-    cpu_stencil(hA, hRef); // hRef holds final CPU result
+    memcpy(ref, hB, N);
+    cpu_stencil(hA, ref);
 
-    // Device memory
     float *dA, *dB;
-    cudaMalloc(&dA, size);
-    cudaMalloc(&dB, size);
+    cudaMalloc(&dA, N);
+    cudaMalloc(&dB, N);
+    cudaMemcpy(dB, hB, N, cudaMemcpyHostToDevice);
 
-    dim3 block(BLOCK, BLOCK);
-    dim3 grid((COLS + BLOCK - 1) / BLOCK,
-              (ROWS + BLOCK - 1) / BLOCK);
+    dim3 block(BX, BY);
+    dim3 grid((COLS + BX - 1) / BX, (ROWS + BY - 1) / BY);
 
     cudaEvent_t start, stop;
+    float time_ms;
+
+    /************* CASE 1: GLOBAL, NO TRAPEZOID *************/
+    cudaMemcpy(dB, hB, N, cudaMemcpyHostToDevice);
+
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
-    float time_ms;
-    bool ok;
-
-    // ===================== CASE 1 =====================
-
-    cudaMemcpy(dB, hB, size, cudaMemcpyHostToDevice);
-
     cudaEventRecord(start);
-    for (int k = 0; k < ITER; k++)
+
+    for (int t = 0; t < ITERS; t++)
     {
         stencil_global<<<grid, block>>>(dA, dB);
         std::swap(dA, dB);
     }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_ms, start, stop);
 
-    cudaMemcpy(hOut, dB, size, cudaMemcpyDeviceToHost);
-    ok = verify(hOut, hRef);
-    printf("Case 1 (Baseline Global)        : %s | Time = %.3f ms\n",
-           ok ? "YES" : "NO", time_ms);
+    cudaMemcpy(hA, dB, N, cudaMemcpyDeviceToHost);
+    printf("Case 1 Global | Time: %.3f ms | Correct: %s\n",
+           time_ms, check(hA, ref) ? "YES" : "NO");
 
-    // ===================== CASE 2 =====================
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-    cudaMemcpy(dB, hB, size, cudaMemcpyHostToDevice);
+    /************* CASE 2: SHARED, NO TRAPEZOID *************/
+    cudaMemcpy(dB, hB, N, cudaMemcpyHostToDevice);
 
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     cudaEventRecord(start);
-    for (int k = 0; k < ITER; k++)
+
+    for (int t = 0; t < ITERS; t++)
     {
         stencil_shared<<<grid, block>>>(dA, dB);
         std::swap(dA, dB);
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time_ms, start, stop);
-
-    cudaMemcpy(hOut, dB, size, cudaMemcpyDeviceToHost);
-    ok = verify(hOut, hRef);
-    printf("Case 2 (Shared Memory)          : %s | Time = %.3f ms\n",
-           ok ? "YES" : "NO", time_ms);
-
-    // ===================== CASE 3 =====================
-
-    // Case 3: Trapezoid – Global Memory (CORRECT)
-
-    float *dTmp1, *dTmp2;
-    cudaMalloc(&dTmp1, size);
-    cudaMalloc(&dTmp2, size);
-
-    cudaMemcpy(dTmp1, hB, size, cudaMemcpyHostToDevice);
-
-    cudaEventRecord(start);
-
-    for (int k = 0; k < ITER; k += H)
-    {
-        float *src = dTmp1;
-        float *dst = dTmp2;
-
-        for (int t = 0; t < H; t++)
-        {
-            int margin = t + 1;
-
-            dim3 block(BLOCK, BLOCK);
-            dim3 grid((COLS + BLOCK - 1) / BLOCK,
-                      (ROWS + BLOCK - 1) / BLOCK);
-
-            stencil_true_trap_global<<<grid, block>>>(
-                dst, src, ROWS, COLS, margin);
-
-            std::swap(src, dst);
-        }
-
-        std::swap(dTmp1, src);
-    }
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_ms, start, stop);
 
-    cudaMemcpy(hOut, dTmp1, size, cudaMemcpyDeviceToHost);
-    ok = verify_interior(hOut, hRef);
+    cudaMemcpy(hA, dB, N, cudaMemcpyDeviceToHost);
+    printf("Case 2 Shared | Time: %.3f ms | Correct: %s\n",
+           time_ms, check(hA, ref) ? "YES" : "NO");
 
-    printf("Case 3 (Trapezoid Global Memory): %s | Time = %.3f ms\n",
-           ok ? "YES" : "NO", time_ms);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-    // ===================== CASE 4 =====================
+    /************* CASE 3: TRAPEZOID, GLOBAL *************/
+    cudaMemcpy(dB, hB, N, cudaMemcpyHostToDevice);
 
-    dim3 block_trap(SHARED, SHARED);
-    dim3 grid_trap((COLS + TILE - 1) / TILE,
-                   (ROWS + TILE - 1) / TILE);
-
-    cudaMemcpy(dB, hB, size, cudaMemcpyHostToDevice);
-
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     cudaEventRecord(start);
-    for (int k = 0; k < ITER; k += H)
+
+    for (int t = 0; t < ITERS; t++)
     {
-        stencil_true_trap_shared<<<grid_trap, block_trap>>>(dA, dB);
+        stencil_trap_global<<<grid, block>>>(dA, dB);
         std::swap(dA, dB);
     }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_ms, start, stop);
 
-    cudaMemcpy(hOut, dB, size, cudaMemcpyDeviceToHost);
-    ok = verify_interior(hOut, hRef);
-    printf("Case 4 (Trapezoid Shared Memory)  : %s | Time = %.3f ms\n",
-           ok ? "YES" : "NO", time_ms);
+    cudaMemcpy(hA, dB, N, cudaMemcpyDeviceToHost);
+    printf("Case 3 Trap Global | Time: %.3f ms | Correct: %s\n",
+           time_ms, check(hA, ref) ? "YES" : "NO");
 
-    // Cleanup
-    cudaFree(dA);
-    cudaFree(dB);
-    free(hA);
-    free(hB);
-    free(hRef);
-    free(hOut);
+    /************* CASE 4: TRAPEZOID, SHARED *************/
+    cudaMemcpy(dB, hB, N, cudaMemcpyHostToDevice);
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    for (int t = 0; t < ITERS; t++)
+    {
+        stencil_trap_shared<<<grid, block>>>(dA, dB);
+        std::swap(dA, dB); 
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time_ms, start, stop);
+
+    cudaMemcpy(hA, dB, N, cudaMemcpyDeviceToHost);
+    printf("Case 4 Trap Shared | Time: %.3f ms | Correct: %s\n",
+           time_ms, check(hA, ref) ? "YES" : "NO");
 
     return 0;
 }
